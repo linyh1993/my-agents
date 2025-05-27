@@ -1,9 +1,0 @@
-# Python MCP Prompt Server Configuration File
-
-SERVER_NAME: "YAML Config Server"
-# SERVER_DESCRIPTION: "Serves prompts as MCP tools, with dynamic loading and reload capability."
-
-# PROMPTS_DIR: "prompts" # Relative to project root, or an absolute path
-
-LOG_LEVEL: "WARNING" # CRITICAL, ERROR, WARNING, INFO, DEBUG
-# LOG_FORMAT: "%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
