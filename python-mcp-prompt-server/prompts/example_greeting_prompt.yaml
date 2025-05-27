@@ -1,0 +1,14 @@
+
+name: "Example Greeting Prompt"
+description: "Generates a personalized greeting (example)."
+arguments:
+  - name: "user_name"
+    description: "The name of the person to greet."
+    type: "string"
+    required: true
+  - name: "time_of_day"
+    description: "Time of day (e.g., morning, afternoon, evening)."
+    type: "string"
+    required: false
+    default: "day" # Example of a default value
+prompt_template: "Good {time_of_day}, {user_name}! Welcome to the Python MCP Prompt Server."

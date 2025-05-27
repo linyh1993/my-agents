@@ -1,275 +1,132 @@
 """
-Main server logic for the Python MCP Prompt Server.
-Handles dynamic creation and registration of MCP tools from prompt definitions,
-and provides management tools for reloading prompts and listing available prompts.
+Python MCP Prompt Server 的主要服务器逻辑。
+处理从提示定义动态创建和注册 MCP 工具，
+并提供用于重新加载提示和列出可用提示的管理工具。
 """
 import os
 import re
-from typing import List, Dict, Any, Callable, Optional as TypingOptional # Explicit for type hints if needed elsewhere
+from typing import List, Dict, Any, Callable, Optional as TypingOptional # 显式导入 TypingOptional 以用于类型提示
 from fastmcp import FastMCP
 from src.prompt_loader import load_prompts_from_directory
-import logging
+from src.config_loader import get_config, get_logger # 导入新的配置函数
+# 导入新的动态工具生成器模块
+from .dynamic_tool_generator import create_and_register_prompt_tool 
 
-# --- Constants and Global Variables ---
-SERVER_NAME = "Python MCP Prompt Server"
-SERVER_DESCRIPTION = "Serves prompts as MCP tools, with dynamic loading and reload capability."
+# --- 加载配置 ---
+config = get_config()
+logger = get_logger(__name__) # 使用配置好的 logger
 
-# Determine project root (assuming this file, server.py, is in PROJECT_ROOT/src/)
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# --- 从配置中获取常量和全局变量 ---
+SERVER_NAME = config["SERVER_NAME"]
+SERVER_DESCRIPTION = config["SERVER_DESCRIPTION"]
+PROMPTS_DIR = config["PROMPTS_DIR"] # 此路径已由 config_loader 解析为绝对路径
 
-# Determine PROMPTS_DIR: configurable via MCP_PROMPTS_DIR environment variable.
-DEFAULT_PROMPTS_PATH = os.path.join(PROJECT_ROOT, "prompts")
-USER_SPECIFIED_PROMPTS_DIR = os.environ.get("MCP_PROMPTS_DIR")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-if USER_SPECIFIED_PROMPTS_DIR:
-    PROMPTS_DIR = os.path.abspath(USER_SPECIFIED_PROMPTS_DIR)
-    logger.info(f"Using prompts directory from MCP_PROMPTS_DIR environment variable: {PROMPTS_DIR}")
-else:
-    PROMPTS_DIR = os.path.abspath(DEFAULT_PROMPTS_PATH)
-    logger.info(f"MCP_PROMPTS_DIR not set. Using default prompts directory: {PROMPTS_DIR}")
-
-# Global FastMCP instance
+# 全局 FastMCP 实例
+# 注意: SERVER_NAME 和 SERVER_DESCRIPTION 现在来自配置
 mcp = FastMCP(name=SERVER_NAME, description=SERVER_DESCRIPTION)
 
-# Global dictionary to keep track of the Python functions created for each prompt tool.
-# Key: Original prompt name. Value: The dynamically generated Python function object.
+# 全局字典，用于跟踪为每个提示工具创建的 Python 函数。
+# 键: 原始提示名称。值: 动态生成的 Python 函数对象。
 REGISTERED_TOOL_FUNCTIONS: Dict[str, Callable[..., Any]] = {}
 
 
-# --- Helper Functions ---
-def _sanitize_for_python_identifier(name: str) -> str:
-    """
-    Sanitizes a string to be a valid Python identifier.
-    - Removes invalid characters (keeps alphanumeric and underscore).
-    - Removes leading non-alphabetic characters (except underscore).
-    - Prefixes with an underscore if the name starts with a digit.
-    - Returns a default name if sanitization results in an empty string.
-    """
-    name = re.sub(r'[^0-9a-zA-Z_]', '', name) # Keep only alphanumeric and underscores
-    name = re.sub(r'^[^a-zA-Z_]+', '', name)  # Remove leading chars if not letter or underscore
-    
-    if not name:
-        return "_unnamed_prompt"
-    if name[0].isdigit(): # Ensure it doesn't start with a digit
-        return "_" + name
-    return name
+# --- 核心服务器管理工具 ---
+# 注意: _sanitize_for_python_identifier, _prepare_function_parameters, 
+#       _generate_dynamic_function_code, 和旧的 create_and_register_prompt_tool
+#       已移至 dynamic_tool_generator.py
 
-
-# --- Dynamic Tool Creation and Registration ---
-# This section handles the dynamic generation of MCP tools from prompt definitions.
-
-def _prepare_function_parameters(arguments_list: List[Dict[str, Any]], original_prompt_name: str) -> tuple[List[str], Dict[str, str]]:
-    """
-    Prepares function signature parameters and a mapping for template formatting
-    based on the arguments defined in a prompt.
-    """
-    arg_definitions_for_signature: List[str] = []
-    arg_map_for_template_format: Dict[str, str] = {}
-
-    if not isinstance(arguments_list, list):
-        logger.warning(f"'arguments' for prompt '{original_prompt_name}' is not a list. No arguments will be processed.")
-        return arg_definitions_for_signature, arg_map_for_template_format
-
-    for arg_info in arguments_list:
-        original_arg_name = arg_info['name']
-        # Ensure py_param_name is valid, using _sanitize_for_python_identifier
-        py_param_name = _sanitize_for_python_identifier(original_arg_name)
-        if not py_param_name:
-            logger.warning(f"Argument name '{original_arg_name}' in prompt '{original_prompt_name}' sanitized to an empty string. Skipping this argument.")
-            continue
-
-        arg_type: type = arg_info.get('type', str) # Assuming type is already Python type from loader
-        is_required: bool = arg_info.get('required', True)
-        default_value: Any = arg_info.get('default', None)
-        
-        type_hint_str = arg_type.__name__ if hasattr(arg_type, '__name__') else "str"
-        param_signature_part = f"{py_param_name}: {type_hint_str}"
-
-        if not is_required:
-            if default_value is not None:
-                param_signature_part += f" = {default_value!r}"
-            else:
-                param_signature_part += " = None"
-        
-        arg_definitions_for_signature.append(param_signature_part)
-        arg_map_for_template_format[original_arg_name] = py_param_name
-            
-    return arg_definitions_for_signature, arg_map_for_template_format
-
-# Extensibility: To support other types of dynamically generated MCP entries (e.g., "resources"),
-# a similar pattern of loading data and then creating/registering MCP objects could be followed,
-# potentially with new "loader" and "creator/register" functions tailored to those types.
-
-def _generate_dynamic_function_code(
-    func_name: str,
-    signature_params_str: str,
-    escaped_docstring: str,
-    escaped_prompt_template: str,
-    format_kwargs_str: str
-) -> str:
-    """
-    Generates the Python source code string for a dynamic prompt tool function.
-    This helper centralizes the code generation template for clarity.
-    """
-    return f"""
-def {func_name}({signature_params_str}) -> str:
-    '''{escaped_docstring}'''
-    # The prompt template string (as a Python string literal)
-    template_str = r'{escaped_prompt_template}' # Use raw string for template
-    
-    # Arguments for .format() are prepared as a dictionary.
-    # Keys are original argument names (from template), values are Python parameter names.
-    format_args = {format_kwargs_str}
-    
-    # .format(**kwargs) substitutes placeholders with values from format_args.
-    return template_str.format(**format_args)
-"""
-
-def create_and_register_prompt_tool(prompt_data: Dict[str, Any], mcp_instance: FastMCP):
-    """
-    Dynamically creates a Python function based on prompt data and registers it with FastMCP.
-
-    Args:
-        prompt_data: Dictionary with prompt definition (name, description, arguments, template).
-        mcp_instance: The FastMCP instance for tool registration.
-    """
-    original_prompt_name = prompt_data['name']
-    sanitized_func_name_base = _sanitize_for_python_identifier(original_prompt_name)
-    py_func_name = f"dynamic_prompt_tool_{sanitized_func_name_base}" # Prefix for clarity
-
-    arguments_list = prompt_data.get('arguments', [])
-    arg_definitions_for_signature, arg_map_for_template_format = _prepare_function_parameters(arguments_list, original_prompt_name)
-
-    signature_params_str = ", ".join(arg_definitions_for_signature)
-    
-    format_kwargs_items = [f"'{orig_name}': {py_name}" for orig_name, py_name in arg_map_for_template_format.items()]
-    format_kwargs_str = f"{{{', '.join(format_kwargs_items)}}}"
-    
-    # Escape template and description for safe embedding in the generated code string.
-    # Using r'' for template in generated code handles backslashes better.
-    escaped_prompt_template = prompt_data['prompt_template'].replace('\\', '\\\\').replace("'", "\\'")
-    escaped_docstring = prompt_data['description'].replace('\\', '\\\\').replace("'", "\\'")
-
-    func_code = _generate_dynamic_function_code(
-        py_func_name, signature_params_str, escaped_docstring,
-        escaped_prompt_template, format_kwargs_str
-    )
-    
-    # Debug: logger.debug generated code
-    # logger.debug(f"--- Generated code for {py_func_name} ---\n{func_code}\n------------------------------------")
-    
-    # Prepare execution scope for `exec`.
-    # `str`, `int`, `bool`, `float`, `None` are builtins. `List`, `Dict`, `Any` are for type hints if evaluated.
-    exec_globals = {'__builtins__': __builtins__, 'List': List, 'Dict': Dict, 'Any': Any}
-    local_scope: Dict[str, Any] = {}
-    try:
-        exec(func_code, exec_globals, local_scope)
-    except Exception as e:
-        logger.error(f"Failed to execute generated code for prompt tool '{original_prompt_name}' (function: {py_func_name}).\n"
-                     f"Error: {e}\nGenerated Code (inspect for issues):\n{func_code}")
-        return # Skip registration if function creation failed
-
-    created_function: TypingOptional[Callable[..., Any]] = local_scope.get(py_func_name)
-
-    if created_function:
-        REGISTERED_TOOL_FUNCTIONS[original_prompt_name] = created_function
-        mcp_instance.tool(name=original_prompt_name, description=prompt_data['description'])(created_function)
-        # logger.info(f"Successfully registered tool: '{original_prompt_name}'")
-    else:
-        # This should be rare if exec didn't raise an error.
-        logger.error(f"Failed to retrieve function '{py_func_name}' from exec scope for prompt '{original_prompt_name}'.")
-
-
-# --- Core Server Management Tools ---
-@mcp.tool(name="get_prompt_names", description="Lists the names of all currently available prompt-based tools.")
+@mcp.tool(name="get_prompt_names", description="列出所有当前可用的基于提示的工具的名称。")
 def get_prompt_names() -> List[str]:
     """
-    Retrieves a list of names for all currently available prompt-based tools,
-    excluding server management tools like 'reload_prompts' and 'get_prompt_names'.
+    检索所有当前可用的基于提示的工具的名称列表，
+    不包括服务器管理工具，如 'reload_prompts' 和 'get_prompt_names'。
     """
-    if not hasattr(mcp, 'tools') or not hasattr(mcp.tools, 'keys'): # Check for .keys() method
-        logger.warning("MCP tools registry not found or not a valid ToolManager. Cannot list prompt names.")
+    if not hasattr(mcp, 'tools') or not hasattr(mcp.tools, 'keys'): # 检查 .keys() 方法
+        logger.warning("MCP 工具注册表未找到或不是有效的 ToolManager。无法列出提示名称。")
         return []
     
     all_tool_names = list(mcp.tools.keys())
-    management_tool_names = {"reload_prompts", "get_prompt_names"}
+    management_tool_names = {"reload_prompts", "get_prompt_names"} # 管理工具名称集合
     prompt_tool_names = [name for name in all_tool_names if name not in management_tool_names]
     return prompt_tool_names
 
 def _reregister_management_tools(mcp_instance: FastMCP):
-    """Helper to re-register essential server management tools after clearing the registry."""
-    mcp_instance.tool(name="reload_prompts", description="Reloads all prompt tools from the prompts directory.")(reload_all_prompts)
-    mcp_instance.tool(name="get_prompt_names", description="Lists the names of all currently available prompt-based tools.")(get_prompt_names)
-    # logger.info("Re-registered essential server tools.")
+    """辅助函数，用于在清除注册表后重新注册必要的服务器管理工具。"""
+    mcp_instance.tool(name="reload_prompts", description="从 prompts 目录重新加载所有提示工具。")(reload_all_prompts)
+    mcp_instance.tool(name="get_prompt_names", description="列出所有当前可用的基于提示的工具的名称。")(get_prompt_names)
+    # logger.info("重新注册了必要的服务器工具。")
 
 def _clear_registered_tools(mcp_instance: FastMCP, registered_tool_functions_dict: Dict[str, Callable[..., Any]]):
-    """Clears all registered tools from FastMCP and the internal tracking dictionary."""
+    """从 FastMCP 和内部跟踪字典中清除所有已注册的工具。"""
     if hasattr(mcp_instance, 'tools') and hasattr(mcp_instance.tools, 'clear'):
-        mcp_instance.tools.clear() # Call clear method of ToolManager
+        mcp_instance.tools.clear() # 调用 ToolManager 的 clear 方法
         registered_tool_functions_dict.clear()
-        logger.info("Cleared existing tools from registry and internal tracking.")
+        logger.info("已从注册表和内部跟踪中清除现有工具。")
     else:
-        # This situation implies an issue with the FastMCP instance or its version/structure.
-        logger.critical("Could not clear FastMCP tools registry (tools attribute missing or no clear method). Reload may result in duplicates or errors.")
+        # 这种情况意味着 FastMCP 实例或其版本/结构存在问题。
+        logger.critical("无法清除 FastMCP 工具注册表 (tools 属性缺失或没有 clear 方法)。重新加载可能会导致重复或错误。")
 
 def _load_and_register_prompt_tools(prompts_dir: str, mcp_instance: FastMCP) -> int:
-    """Loads prompts from directory and registers them as tools."""
+    """从目录加载提示并将其注册为工具。"""
     loaded_prompts_data = load_prompts_from_directory(prompts_dir)
     num_registered = 0
     
     if not loaded_prompts_data:
-        status_msg = f"Prompts directory '{prompts_dir}' is empty or contains no valid prompts. No dynamic tools loaded."
+        status_msg = f"提示目录 '{prompts_dir}' 为空或不包含有效提示。未加载任何动态工具。"
     else:
-        logger.info(f"Found {len(loaded_prompts_data)} prompt definitions to process from '{prompts_dir}'.")
+        logger.info(f"从 '{prompts_dir}' 找到 {len(loaded_prompts_data)} 个要处理的提示定义。")
         for p_data in loaded_prompts_data:
             try:
-                create_and_register_prompt_tool(p_data, mcp_instance)
+                # 更新调用以传递 logger 和 REGISTERED_TOOL_FUNCTIONS
+                create_and_register_prompt_tool(
+                    p_data, 
+                    mcp_instance, 
+                    logger, 
+                    REGISTERED_TOOL_FUNCTIONS
+                )
                 num_registered += 1
-            except Exception as e:
-                prompt_name = p_data.get('name', 'Unnamed Prompt')
-                logger.error(f"Failed to create/register tool for prompt '{prompt_name}': {e}", exc_info=True)
-        status_msg = f"Successfully registered {num_registered} dynamic tools from '{prompts_dir}'."
+            except Exception as e: # 捕获循环期间的全部异常以确保安全
+                prompt_name = p_data.get('name', '未命名提示')
+                logger.error(f"为提示 '{prompt_name}' 创建/注册工具失败: {e}", exc_info=True)
+        status_msg = f"已成功从 '{prompts_dir}' 注册 {num_registered} 个动态工具。"
     
     logger.info(status_msg)
     return num_registered
 
-@mcp.tool(name="reload_prompts", description="Reloads all prompt tools from the prompts directory.")
+@mcp.tool(name="reload_prompts", description="从 prompts 目录重新加载所有提示工具。")
 def reload_all_prompts() -> str:
     """
-    Clears existing prompt-based tools, re-loads all prompts from PROMPTS_DIR,
-    and registers them as new tools. Essential management tools are also re-registered.
+    清除现有的基于提示的工具，从 PROMPTS_DIR 重新加载所有提示，
+    并将它们注册为新工具。必要的管理工具也会被重新注册。
     """
-    global REGISTERED_TOOL_FUNCTIONS # Necessary as _clear_registered_tools modifies it
-    logger.info(f"Reloading prompts from directory: {PROMPTS_DIR}...")
+    global REGISTERED_TOOL_FUNCTIONS # _clear_registered_tools 会修改它，因此必需
+    logger.info(f"正在从目录重新加载提示: {PROMPTS_DIR}...")
     
     _clear_registered_tools(mcp, REGISTERED_TOOL_FUNCTIONS)
     
     _load_and_register_prompt_tools(PROMPTS_DIR, mcp)
     
-    _reregister_management_tools(mcp) 
+    _reregister_management_tools(mcp) # 确保管理工具始终可用
     
-    final_tool_count = len(get_prompt_names()) # get_prompt_names excludes management tools
-    status_msg = f"Prompts reloaded. {final_tool_count} dynamic tools available. Management tools re-registered."
+    final_tool_count = len(get_prompt_names()) # get_prompt_names 不包括管理工具
+    status_msg = f"提示已重新加载。{final_tool_count} 个动态工具可用。管理工具已重新注册。"
     logger.info(status_msg)
     return status_msg
 
 
-# --- Server Initialization and Startup ---
+# --- 服务器初始化和启动 ---
 def _ensure_prompts_directory_exists():
     """
-    Checks if PROMPTS_DIR exists, creates it if not, and adds an example prompt if newly created.
-    Uses the globally configured PROMPTS_DIR.
+    检查 PROMPTS_DIR 是否存在，如果不存在则创建它，并在新创建时添加示例提示。
+    使用全局配置的 PROMPTS_DIR。
     """
+    # PROMPTS_DIR 现在来自配置模块
     if not os.path.exists(PROMPTS_DIR):
-        logger.info(f"Prompts directory '{PROMPTS_DIR}' not found. Creating it...")
+        logger.info(f"提示目录 '{PROMPTS_DIR}' 未找到。正在创建它...")
         try:
             os.makedirs(PROMPTS_DIR)
-            logger.info(f"Successfully created prompts directory: {PROMPTS_DIR}")
-            # Create an example prompt to guide the user and for initial testing.
+            logger.info(f"成功创建提示目录: {PROMPTS_DIR}")
+            # 创建一个示例提示以指导用户并用于初始测试。
             example_prompt_content = """
 name: "Example Greeting Prompt"
 description: "Generates a personalized greeting (example)."
@@ -288,36 +145,46 @@ prompt_template: "Good {time_of_day}, {user_name}! Welcome to the Python MCP Pro
             example_filepath = os.path.join(PROMPTS_DIR, "example_greeting_prompt.yaml")
             with open(example_filepath, "w", encoding='utf-8') as f:
                 f.write(example_prompt_content)
-            logger.info(f"Created an example prompt: '{example_filepath}'")
+            logger.info(f"已创建示例提示: '{example_filepath}'")
         except OSError as e:
-            logger.error(f"Could not create prompts directory '{PROMPTS_DIR}' or example prompt: {e}\n"
-                         "Please ensure you have write permissions or create the directory manually.")
+            logger.error(f"无法创建提示目录 '{PROMPTS_DIR}' 或示例提示: {e}\n"
+                         "请确保您有写入权限或手动创建目录。")
 
 def initial_server_setup_and_load():
     """
-    Performs initial setup: ensures prompts directory exists and loads initial prompts.
+    执行初始设置: 确保提示目录存在并加载初始提示。
     """
-    logger.info(f"Initializing server... Configured prompts directory: {PROMPTS_DIR}")
+    # PROMPTS_DIR 和 SERVER_NAME 现在来自配置模块
+    logger.info(f"正在初始化服务器 '{SERVER_NAME}'... 配置的提示目录: {PROMPTS_DIR}")
     _ensure_prompts_directory_exists()
-    reload_all_prompts() # This also registers management tools
+    reload_all_prompts() # 这也会注册管理工具
 
 if __name__ == "__main__":
-    logger.info(f"Starting {SERVER_NAME}...")
+    # SERVER_NAME 和 PROMPTS_DIR 来自配置
+    logger.info(f"正在启动 {SERVER_NAME}...")
     initial_server_setup_and_load()
     
-    current_tools = list(mcp.tools.keys())
-    if current_tools:
-        logger.info(f"FastMCP server '{mcp.name}' running. Registered tools ({len(current_tools)}):")
-        for tool_name in sorted(current_tools): # Sort for consistent output
-            logger.info(f"  - {tool_name}")
+    # 安全地尝试列出当前工具
+    if hasattr(mcp, 'tools') and mcp.tools is not None and hasattr(mcp.tools, 'keys'):
+        try:
+            current_tools = list(mcp.tools.keys())
+            if current_tools:
+                logger.info(f"FastMCP 服务器 '{mcp.name}' 正在运行。已注册工具 ({len(current_tools)}):")
+                for tool_name in sorted(current_tools): # 排序以保证一致输出
+                    logger.info(f"  - {tool_name}")
+            else:
+                logger.info(f"FastMCP 服务器 '{mcp.name}' 正在运行，但当前没有注册任何工具 (在初始加载后)。")
+        except Exception as e:
+            logger.warning(f"启动时因意外错误无法列出工具: {e}", exc_info=True)
     else:
-        logger.info(f"FastMCP server '{mcp.name}' running, but no tools are currently registered.")
-        logger.info(f"Please check the '{PROMPTS_DIR}' directory for prompt files or any error messages above.")
+        logger.warning(f"FastMCP 服务器 '{mcp.name}' 正在运行，但工具管理器 (mcp.tools) 在启动时不可用或不是有效的 ToolManager。无法列出工具。")
+        
+    logger.info(f"如果缺少工具，请检查 '{PROMPTS_DIR}' 目录中的提示文件或上面的任何错误消息。")
         
     try:
-        mcp.run() # Start the FastMCP server (uses STDIO transport by default)
+        mcp.run() # 启动 FastMCP 服务器 (默认使用 STDIO 传输)
     except Exception as e:
-        logger.error(f"FastMCP server failed to run: {e}")
+        logger.error(f"FastMCP 服务器运行失败: {e}", exc_info=True) # 添加 exc_info 以获取完整回溯
     finally:
-        logger.info(f"{SERVER_NAME} has stopped.")
+        logger.info(f"{SERVER_NAME} 已停止。")
 
