@@ -8,6 +8,7 @@ import re
 from typing import List, Dict, Any, Callable, Optional as TypingOptional # Explicit for type hints if needed elsewhere
 from fastmcp import FastMCP
 from src.prompt_loader import load_prompts_from_directory
+import logging
 
 # --- Constants and Global Variables ---
 SERVER_NAME = "Python MCP Prompt Server"
@@ -20,12 +21,16 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PROMPTS_PATH = os.path.join(PROJECT_ROOT, "prompts")
 USER_SPECIFIED_PROMPTS_DIR = os.environ.get("MCP_PROMPTS_DIR")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 if USER_SPECIFIED_PROMPTS_DIR:
     PROMPTS_DIR = os.path.abspath(USER_SPECIFIED_PROMPTS_DIR)
-    print(f"INFO: Using prompts directory from MCP_PROMPTS_DIR environment variable: {PROMPTS_DIR}")
+    logger.info(f"Using prompts directory from MCP_PROMPTS_DIR environment variable: {PROMPTS_DIR}")
 else:
     PROMPTS_DIR = os.path.abspath(DEFAULT_PROMPTS_PATH)
-    print(f"INFO: MCP_PROMPTS_DIR not set. Using default prompts directory: {PROMPTS_DIR}")
+    logger.info(f"MCP_PROMPTS_DIR not set. Using default prompts directory: {PROMPTS_DIR}")
 
 # Global FastMCP instance
 mcp = FastMCP(name=SERVER_NAME, description=SERVER_DESCRIPTION)
@@ -56,6 +61,45 @@ def _sanitize_for_python_identifier(name: str) -> str:
 
 # --- Dynamic Tool Creation and Registration ---
 # This section handles the dynamic generation of MCP tools from prompt definitions.
+
+def _prepare_function_parameters(arguments_list: List[Dict[str, Any]], original_prompt_name: str) -> tuple[List[str], Dict[str, str]]:
+    """
+    Prepares function signature parameters and a mapping for template formatting
+    based on the arguments defined in a prompt.
+    """
+    arg_definitions_for_signature: List[str] = []
+    arg_map_for_template_format: Dict[str, str] = {}
+
+    if not isinstance(arguments_list, list):
+        logger.warning(f"'arguments' for prompt '{original_prompt_name}' is not a list. No arguments will be processed.")
+        return arg_definitions_for_signature, arg_map_for_template_format
+
+    for arg_info in arguments_list:
+        original_arg_name = arg_info['name']
+        # Ensure py_param_name is valid, using _sanitize_for_python_identifier
+        py_param_name = _sanitize_for_python_identifier(original_arg_name)
+        if not py_param_name:
+            logger.warning(f"Argument name '{original_arg_name}' in prompt '{original_prompt_name}' sanitized to an empty string. Skipping this argument.")
+            continue
+
+        arg_type: type = arg_info.get('type', str) # Assuming type is already Python type from loader
+        is_required: bool = arg_info.get('required', True)
+        default_value: Any = arg_info.get('default', None)
+        
+        type_hint_str = arg_type.__name__ if hasattr(arg_type, '__name__') else "str"
+        param_signature_part = f"{py_param_name}: {type_hint_str}"
+
+        if not is_required:
+            if default_value is not None:
+                param_signature_part += f" = {default_value!r}"
+            else:
+                param_signature_part += " = None"
+        
+        arg_definitions_for_signature.append(param_signature_part)
+        arg_map_for_template_format[original_arg_name] = py_param_name
+            
+    return arg_definitions_for_signature, arg_map_for_template_format
+
 # Extensibility: To support other types of dynamically generated MCP entries (e.g., "resources"),
 # a similar pattern of loading data and then creating/registering MCP objects could be followed,
 # potentially with new "loader" and "creator/register" functions tailored to those types.
@@ -97,40 +141,8 @@ def create_and_register_prompt_tool(prompt_data: Dict[str, Any], mcp_instance: F
     sanitized_func_name_base = _sanitize_for_python_identifier(original_prompt_name)
     py_func_name = f"dynamic_prompt_tool_{sanitized_func_name_base}" # Prefix for clarity
 
-    arg_definitions_for_signature: List[str] = []
-    arg_map_for_template_format: Dict[str, str] = {} # Maps template {{var}} to py_param_name
-
     arguments_list = prompt_data.get('arguments', [])
-    if not isinstance(arguments_list, list): # Ensure 'arguments' is a list
-        print(f"Warning: 'arguments' for prompt '{original_prompt_name}' is not a list. "
-              "No arguments will be processed for this tool.")
-        arguments_list = []
-
-    for arg_info in arguments_list:
-        original_arg_name = arg_info['name']
-        py_param_name = _sanitize_for_python_identifier(original_arg_name)
-        if not py_param_name: # Handle cases where sanitization might yield empty string
-            print(f"Warning: Argument name '{original_arg_name}' in prompt '{original_prompt_name}' "
-                  "sanitized to an empty string. Skipping this argument.")
-            continue
-
-        arg_type: type = arg_info.get('type', str) # Default to str
-        is_required: bool = arg_info.get('required', True) # Default to required
-        default_value: Any = arg_info.get('default', None)
-        
-        type_hint_str = arg_type.__name__ if hasattr(arg_type, '__name__') else "str"
-        param_signature_part = f"{py_param_name}: {type_hint_str}"
-
-        if not is_required: # Handle optional arguments and their defaults
-            if default_value is not None:
-                # Use repr() for default values to get their Python literal representation
-                # e.g., "string" -> '"string"', True -> 'True', None -> 'None'
-                param_signature_part += f" = {default_value!r}"
-            else: # Optional argument without a specified default
-                param_signature_part += " = None" 
-        
-        arg_definitions_for_signature.append(param_signature_part)
-        arg_map_for_template_format[original_arg_name] = py_param_name
+    arg_definitions_for_signature, arg_map_for_template_format = _prepare_function_parameters(arguments_list, original_prompt_name)
 
     signature_params_str = ", ".join(arg_definitions_for_signature)
     
@@ -147,8 +159,8 @@ def create_and_register_prompt_tool(prompt_data: Dict[str, Any], mcp_instance: F
         escaped_prompt_template, format_kwargs_str
     )
     
-    # Debug: print generated code
-    # print(f"--- Generated code for {py_func_name} ---\n{func_code}\n------------------------------------")
+    # Debug: logger.debug generated code
+    # logger.debug(f"--- Generated code for {py_func_name} ---\n{func_code}\n------------------------------------")
     
     # Prepare execution scope for `exec`.
     # `str`, `int`, `bool`, `float`, `None` are builtins. `List`, `Dict`, `Any` are for type hints if evaluated.
@@ -157,8 +169,8 @@ def create_and_register_prompt_tool(prompt_data: Dict[str, Any], mcp_instance: F
     try:
         exec(func_code, exec_globals, local_scope)
     except Exception as e:
-        print(f"ERROR: Failed to execute generated code for prompt tool '{original_prompt_name}' (function: {py_func_name}).\n"
-              f"Error: {e}\nGenerated Code (inspect for issues):\n{func_code}")
+        logger.error(f"Failed to execute generated code for prompt tool '{original_prompt_name}' (function: {py_func_name}).\n"
+                     f"Error: {e}\nGenerated Code (inspect for issues):\n{func_code}")
         return # Skip registration if function creation failed
 
     created_function: TypingOptional[Callable[..., Any]] = local_scope.get(py_func_name)
@@ -166,10 +178,10 @@ def create_and_register_prompt_tool(prompt_data: Dict[str, Any], mcp_instance: F
     if created_function:
         REGISTERED_TOOL_FUNCTIONS[original_prompt_name] = created_function
         mcp_instance.tool(name=original_prompt_name, description=prompt_data['description'])(created_function)
-        # print(f"Successfully registered tool: '{original_prompt_name}'")
+        # logger.info(f"Successfully registered tool: '{original_prompt_name}'")
     else:
         # This should be rare if exec didn't raise an error.
-        print(f"ERROR: Failed to retrieve function '{py_func_name}' from exec scope for prompt '{original_prompt_name}'.")
+        logger.error(f"Failed to retrieve function '{py_func_name}' from exec scope for prompt '{original_prompt_name}'.")
 
 
 # --- Core Server Management Tools ---
@@ -179,8 +191,8 @@ def get_prompt_names() -> List[str]:
     Retrieves a list of names for all currently available prompt-based tools,
     excluding server management tools like 'reload_prompts' and 'get_prompt_names'.
     """
-    if not hasattr(mcp, 'tools') or not isinstance(mcp.tools, dict):
-        print("Warning: MCP tools registry not found or not a dictionary. Cannot list prompt names.")
+    if not hasattr(mcp, 'tools') or not hasattr(mcp.tools, 'keys'): # Check for .keys() method
+        logger.warning("MCP tools registry not found or not a valid ToolManager. Cannot list prompt names.")
         return []
     
     all_tool_names = list(mcp.tools.keys())
@@ -192,7 +204,38 @@ def _reregister_management_tools(mcp_instance: FastMCP):
     """Helper to re-register essential server management tools after clearing the registry."""
     mcp_instance.tool(name="reload_prompts", description="Reloads all prompt tools from the prompts directory.")(reload_all_prompts)
     mcp_instance.tool(name="get_prompt_names", description="Lists the names of all currently available prompt-based tools.")(get_prompt_names)
-    # print("Re-registered essential server tools.")
+    # logger.info("Re-registered essential server tools.")
+
+def _clear_registered_tools(mcp_instance: FastMCP, registered_tool_functions_dict: Dict[str, Callable[..., Any]]):
+    """Clears all registered tools from FastMCP and the internal tracking dictionary."""
+    if hasattr(mcp_instance, 'tools') and hasattr(mcp_instance.tools, 'clear'):
+        mcp_instance.tools.clear() # Call clear method of ToolManager
+        registered_tool_functions_dict.clear()
+        logger.info("Cleared existing tools from registry and internal tracking.")
+    else:
+        # This situation implies an issue with the FastMCP instance or its version/structure.
+        logger.critical("Could not clear FastMCP tools registry (tools attribute missing or no clear method). Reload may result in duplicates or errors.")
+
+def _load_and_register_prompt_tools(prompts_dir: str, mcp_instance: FastMCP) -> int:
+    """Loads prompts from directory and registers them as tools."""
+    loaded_prompts_data = load_prompts_from_directory(prompts_dir)
+    num_registered = 0
+    
+    if not loaded_prompts_data:
+        status_msg = f"Prompts directory '{prompts_dir}' is empty or contains no valid prompts. No dynamic tools loaded."
+    else:
+        logger.info(f"Found {len(loaded_prompts_data)} prompt definitions to process from '{prompts_dir}'.")
+        for p_data in loaded_prompts_data:
+            try:
+                create_and_register_prompt_tool(p_data, mcp_instance)
+                num_registered += 1
+            except Exception as e:
+                prompt_name = p_data.get('name', 'Unnamed Prompt')
+                logger.error(f"Failed to create/register tool for prompt '{prompt_name}': {e}", exc_info=True)
+        status_msg = f"Successfully registered {num_registered} dynamic tools from '{prompts_dir}'."
+    
+    logger.info(status_msg)
+    return num_registered
 
 @mcp.tool(name="reload_prompts", description="Reloads all prompt tools from the prompts directory.")
 def reload_all_prompts() -> str:
@@ -200,34 +243,18 @@ def reload_all_prompts() -> str:
     Clears existing prompt-based tools, re-loads all prompts from PROMPTS_DIR,
     and registers them as new tools. Essential management tools are also re-registered.
     """
-    global REGISTERED_TOOL_FUNCTIONS
-    print(f"Reloading prompts from directory: {PROMPTS_DIR}...")
+    global REGISTERED_TOOL_FUNCTIONS # Necessary as _clear_registered_tools modifies it
+    logger.info(f"Reloading prompts from directory: {PROMPTS_DIR}...")
     
-    if hasattr(mcp, 'tools') and isinstance(mcp.tools, dict):
-        mcp.tools.clear() # Clears all tools from FastMCP's registry
-        REGISTERED_TOOL_FUNCTIONS.clear() # Clear our internal tracking
-    else:
-        # This situation implies an issue with the FastMCP instance or its version.
-        print("CRITICAL WARNING: Could not clear FastMCP tools registry. Reload may result in duplicates or errors.")
-
-    loaded_prompts_data = load_prompts_from_directory(PROMPTS_DIR)
+    _clear_registered_tools(mcp, REGISTERED_TOOL_FUNCTIONS)
     
-    num_registered = 0
-    if not loaded_prompts_data:
-        status_msg = f"Prompts directory '{PROMPTS_DIR}' is empty or contains no valid prompts. No dynamic tools loaded."
-    else:
-        print(f"Found {len(loaded_prompts_data)} prompt definitions to process from '{PROMPTS_DIR}'.")
-        for p_data in loaded_prompts_data:
-            try:
-                create_and_register_prompt_tool(p_data, mcp)
-                num_registered += 1
-            except Exception as e: # Catch-all during the loop for safety
-                prompt_name = p_data.get('name', 'Unnamed Prompt')
-                print(f"ERROR: Failed to create/register tool for prompt '{prompt_name}': {e}")
-        status_msg = f"Prompts reloaded. {num_registered} dynamic tools registered from '{PROMPTS_DIR}'."
-
-    _reregister_management_tools(mcp) # Ensure management tools are always available
-    print(status_msg)
+    _load_and_register_prompt_tools(PROMPTS_DIR, mcp)
+    
+    _reregister_management_tools(mcp) 
+    
+    final_tool_count = len(get_prompt_names()) # get_prompt_names excludes management tools
+    status_msg = f"Prompts reloaded. {final_tool_count} dynamic tools available. Management tools re-registered."
+    logger.info(status_msg)
     return status_msg
 
 
@@ -238,10 +265,10 @@ def _ensure_prompts_directory_exists():
     Uses the globally configured PROMPTS_DIR.
     """
     if not os.path.exists(PROMPTS_DIR):
-        print(f"Prompts directory '{PROMPTS_DIR}' not found. Creating it...")
+        logger.info(f"Prompts directory '{PROMPTS_DIR}' not found. Creating it...")
         try:
             os.makedirs(PROMPTS_DIR)
-            print(f"Successfully created prompts directory: {PROMPTS_DIR}")
+            logger.info(f"Successfully created prompts directory: {PROMPTS_DIR}")
             # Create an example prompt to guide the user and for initial testing.
             example_prompt_content = """
 name: "Example Greeting Prompt"
@@ -256,41 +283,41 @@ arguments:
     type: "string"
     required: false
     default: "day" # Example of a default value
-prompt_template: "Good {{time_of_day}}, {{user_name}}! Welcome to the Python MCP Prompt Server."
+prompt_template: "Good {time_of_day}, {user_name}! Welcome to the Python MCP Prompt Server."
 """
             example_filepath = os.path.join(PROMPTS_DIR, "example_greeting_prompt.yaml")
             with open(example_filepath, "w", encoding='utf-8') as f:
                 f.write(example_prompt_content)
-            print(f"Created an example prompt: '{example_filepath}'")
+            logger.info(f"Created an example prompt: '{example_filepath}'")
         except OSError as e:
-            print(f"ERROR: Could not create prompts directory '{PROMPTS_DIR}' or example prompt: {e}\n"
-                  "Please ensure you have write permissions or create the directory manually.")
+            logger.error(f"Could not create prompts directory '{PROMPTS_DIR}' or example prompt: {e}\n"
+                         "Please ensure you have write permissions or create the directory manually.")
 
 def initial_server_setup_and_load():
     """
     Performs initial setup: ensures prompts directory exists and loads initial prompts.
     """
-    print(f"Initializing server... Configured prompts directory: {PROMPTS_DIR}")
+    logger.info(f"Initializing server... Configured prompts directory: {PROMPTS_DIR}")
     _ensure_prompts_directory_exists()
     reload_all_prompts() # This also registers management tools
 
 if __name__ == "__main__":
-    print(f"Starting {SERVER_NAME}...")
+    logger.info(f"Starting {SERVER_NAME}...")
     initial_server_setup_and_load()
     
     current_tools = list(mcp.tools.keys())
     if current_tools:
-        print(f"FastMCP server '{mcp.name}' running. Registered tools ({len(current_tools)}):")
+        logger.info(f"FastMCP server '{mcp.name}' running. Registered tools ({len(current_tools)}):")
         for tool_name in sorted(current_tools): # Sort for consistent output
-            print(f"  - {tool_name}")
+            logger.info(f"  - {tool_name}")
     else:
-        print(f"FastMCP server '{mcp.name}' running, but no tools are currently registered.")
-        print(f"Please check the '{PROMPTS_DIR}' directory for prompt files or any error messages above.")
+        logger.info(f"FastMCP server '{mcp.name}' running, but no tools are currently registered.")
+        logger.info(f"Please check the '{PROMPTS_DIR}' directory for prompt files or any error messages above.")
         
     try:
         mcp.run() # Start the FastMCP server (uses STDIO transport by default)
     except Exception as e:
-        print(f"CRITICAL ERROR: FastMCP server failed to run: {e}")
+        logger.error(f"FastMCP server failed to run: {e}")
     finally:
-        print(f"{SERVER_NAME} has stopped.")
+        logger.info(f"{SERVER_NAME} has stopped.")
 

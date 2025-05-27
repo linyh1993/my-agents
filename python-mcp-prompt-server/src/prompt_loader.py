@@ -5,6 +5,10 @@ import os
 import json
 from typing import List, Dict, Any, Optional, Type
 import yaml  # PyYAML
+import logging
+
+# Get a logger instance
+logger = logging.getLogger(__name__)
 
 # Type mapping from YAML/JSON string to Python type object
 TYPE_MAPPING: Dict[str, Type] = {
@@ -26,7 +30,7 @@ def _parse_prompt_argument(arg_data: Dict[str, Any], source_filepath: str) -> Op
         A dictionary with processed argument details, or None if validation fails.
     """
     if not isinstance(arg_data, dict) or "name" not in arg_data:
-        print(f"Warning: Skipping invalid argument structure in '{source_filepath}': {arg_data}")
+        logger.warning(f"Skipping invalid argument structure in '{source_filepath}': {arg_data}")
         return None
 
     arg_name: str = arg_data["name"]
@@ -36,7 +40,7 @@ def _parse_prompt_argument(arg_data: Dict[str, Any], source_filepath: str) -> Op
     python_type: Type = TYPE_MAPPING.get(arg_type_str, str)
     if arg_type_str not in TYPE_MAPPING:
         # Log if an unknown type string is encountered, but still default to 'str'
-        print(f"Warning: Unknown argument type '{arg_data.get('type')}' for argument '{arg_name}' in '{source_filepath}'. Defaulting to 'string'.")
+        logger.warning(f"Unknown argument type '{arg_data.get('type')}' for argument '{arg_name}' in '{source_filepath}'. Defaulting to 'string'.")
 
     is_required: bool = arg_data.get("required", True) # Arguments are required by default
     default_value: Any = arg_data.get("default", None)
@@ -54,20 +58,20 @@ def _parse_prompt_argument(arg_data: Dict[str, Any], source_filepath: str) -> Op
                 # Add more specific coercions here if other patterns emerge
                 
                 if not isinstance(default_value, python_type): # Re-check after attempted coercion
-                    print(f"Warning: Default value '{original_default_value}' for argument '{arg_name}' in '{source_filepath}' "
-                          f"could not be coerced to type '{arg_type_str}'. Default value ignored.")
+                    logger.warning(f"Default value '{original_default_value}' for argument '{arg_name}' in '{source_filepath}' "
+                                   f"could not be coerced to type '{arg_type_str}'. Default value ignored.")
                     default_value = None # Nullify if coercion failed
             except (ValueError, TypeError) as e:
-                print(f"Warning: Error coercing default value '{original_default_value}' for argument '{arg_name}' in '{source_filepath}' "
-                      f"to type '{arg_type_str}': {e}. Default value ignored.")
+                logger.warning(f"Error coercing default value '{original_default_value}' for argument '{arg_name}' in '{source_filepath}' "
+                               f"to type '{arg_type_str}': {e}. Default value ignored.")
                 default_value = None # Nullify on error
     
     effective_default = None
     if not is_required:
         effective_default = default_value # Use coerced (or original if valid) default value
     elif default_value is not None: # is_required is True but a default was provided
-         print(f"Warning: Argument '{arg_name}' in '{source_filepath}' is required but also has a default value. "
-              "The default value will be ignored as the argument is mandatory.")
+         logger.warning(f"Argument '{arg_name}' in '{source_filepath}' is required but also has a default value. "
+                        "The default value will be ignored as the argument is mandatory.")
          # effective_default remains None for required arguments
 
     return {
@@ -95,7 +99,7 @@ def load_prompts_from_directory(directory_path: str) -> List[Dict[str, Any]]:
     """
     prompts: List[Dict[str, Any]] = []
     if not os.path.isdir(directory_path):
-        print(f"Warning: Prompt directory '{directory_path}' not found or is not a directory.")
+        logger.warning(f"Prompt directory '{directory_path}' not found or is not a directory.")
         return prompts
 
     for filename in os.listdir(directory_path):
@@ -116,11 +120,11 @@ def load_prompts_from_directory(directory_path: str) -> List[Dict[str, Any]]:
                     file_content = json.load(f)
             else:
                 # Silently skip files not matching expected extensions, or log if verbose debugging is needed.
-                # print(f"Info: Skipping non-YAML/JSON file: '{filepath}'")
+                # logger.info(f"Skipping non-YAML/JSON file: '{filepath}'")
                 continue 
 
             if not isinstance(file_content, dict): # Ensure content is a dictionary (e.g. not just a string in a YAML file)
-                print(f"Warning: Content of file '{filepath}' is not a valid dictionary structure. Skipping.")
+                logger.warning(f"Content of file '{filepath}' is not a valid dictionary structure. Skipping.")
                 continue
             
             # Basic structure validation for essential prompt fields
@@ -131,8 +135,8 @@ def load_prompts_from_directory(directory_path: str) -> List[Dict[str, Any]]:
             if not (isinstance(name, str) and name and
                     isinstance(description, str) and description and
                     isinstance(prompt_template, str) and prompt_template):
-                print(f"Warning: Skipping file '{filepath}' due to missing or invalid required fields. "
-                      "'name', 'description', and 'prompt_template' must be non-empty strings.")
+                logger.warning(f"Skipping file '{filepath}' due to missing or invalid required fields. "
+                               "'name', 'description', and 'prompt_template' must be non-empty strings.")
                 continue
 
             # Process arguments list
@@ -144,8 +148,8 @@ def load_prompts_from_directory(directory_path: str) -> List[Dict[str, Any]]:
                     if parsed_arg:
                         processed_arguments.append(parsed_arg)
             elif arguments_data is not None: # If 'arguments' exists but is not a list
-                print(f"Warning: 'arguments' field in '{filepath}' is not a list. "
-                      "No arguments will be processed for this prompt.")
+                logger.warning(f"'arguments' field in '{filepath}' is not a list. "
+                               "No arguments will be processed for this prompt.")
 
             prompts.append({
                 "name": name,
@@ -156,10 +160,10 @@ def load_prompts_from_directory(directory_path: str) -> List[Dict[str, Any]]:
             })
 
         except yaml.YAMLError as e:
-            print(f"Warning: Error parsing YAML file '{filepath}': {e}")
+            logger.warning(f"Error parsing YAML file '{filepath}': {e}")
         except json.JSONDecodeError as e:
-            print(f"Warning: Error parsing JSON file '{filepath}': {e}")
+            logger.warning(f"Error parsing JSON file '{filepath}': {e}")
         except Exception as e: # Catch other potential errors during file processing
-            print(f"Warning: An unexpected error occurred while processing file '{filepath}': {e}")
+            logger.warning(f"An unexpected error occurred while processing file '{filepath}': {e}")
 
     return prompts
